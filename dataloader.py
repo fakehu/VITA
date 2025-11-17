@@ -177,7 +177,7 @@ def plot_trajectory_data_ori(loader, num_samples=5):
         ax.legend()
     
     plt.tight_layout()
-    plt.show()
+    plt.show(block=False)
 
 if __name__ == "__main__":
     import sys
