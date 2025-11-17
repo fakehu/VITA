@@ -206,6 +206,192 @@ class VITA_Large(nn.Module):
         return predicted_vector_field
 
 
+class VITA_Large_VAE(nn.Module):
+    def __init__(self, trajectory_dim=3, condition_dim=1606, hidden_dim=1024, num_timesteps=1000, 
+                 num_layers=8, num_heads=16, dropout=0.1):
+        super().__init__()
+        
+        self.trajectory_dim = trajectory_dim
+        self.condition_dim = condition_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.num_timesteps = num_timesteps
+
+        # 条件编码 - 更深的网络
+        self.condition_encoder = nn.Sequential(
+            nn.Linear(condition_dim, 4*hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4*hidden_dim, 2*hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2*hidden_dim, hidden_dim)
+        )
+
+        # 正弦位置编码
+        self.positional_encoding = PositionalEncoding(hidden_dim, max_len=1000)
+
+        # 时间步编码 - 更丰富的表示
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, hidden_dim//2),
+            nn.GELU(),
+            nn.Linear(hidden_dim//2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # 轨迹编码 - 更深的编码器
+        self.trajectory_encoder = nn.Sequential(
+            nn.Linear(trajectory_dim, hidden_dim//2),
+            nn.GELU(),
+            nn.Linear(hidden_dim//2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # 特征融合编码 - 更宽更深的融合网络
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Transformer编码器 - 多层Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=4*hidden_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+
+        # condtion编码器
+        self.condition_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim*2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim*2, hidden_dim),
+        )
+
+        #flow_matchine
+        self.flow_matchine = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim*2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim*2, hidden_dim)
+        )
+
+        self.action_encoder = nn.Sequential(
+            nn.Linear(trajectory_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim*2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim*2, hidden_dim),
+        )
+
+        self.action_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim*2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim*2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, trajectory_dim),
+
+        )
+
+        # 残差连接和层归一化
+        self.layer_norm1 = nn.LayerNorm(hidden_dim)
+        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+
+        # 初始化权重
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.constant_(module.bias, 0)
+            torch.nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, condition, timesteps, ground_truth_trajectory):
+        """
+        condition: [batch_size, condition_dim]
+        timesteps: [batch_size] - 在flow matching中是时间t ∈ [0,1]
+        """
+        batch_size, seq_len, _ = ground_truth_trajectory.shape
+        
+        # 1.condition处理
+        # # 1.1 编码轨迹
+        # traj_embed = self.trajectory_encoder(noisy_trajectory)  # [batch_size, seq_len, hidden_dim]
+        
+        # 1.1 编码条件信息
+        cond_embed = self.condition_encoder(condition)  # [batch_size, hidden_dim]
+        cond_embed = cond_embed.unsqueeze(1).repeat(1, seq_len, 1)  # [batch_size, seq_len, hidden_dim]
+        
+        # 1.2 编码时间步
+        time_embed = self.time_embedding(timesteps.unsqueeze(1).float())  # [batch_size, hidden_dim]
+        time_embed = time_embed.unsqueeze(1).repeat(1, seq_len, 1)  # [batch_size, seq_len, hidden_dim]
+        
+        # 1.3 合并所有特征
+        combined = torch.cat([cond_embed, time_embed], dim=-1)  # [batch_size, seq_len, hidden_dim * 2]
+        fused_features = self.feature_fusion(combined)  # [batch_size, seq_len, hidden_dim]
+
+        # 1.4 添加位置编码
+        fused_features = self.positional_encoding(fused_features)
+
+        # 1.5 Transformer处理 (使用残差连接)
+        transformer_input = self.layer_norm1(fused_features)
+        encoded_condition = self.transformer(transformer_input)  # [batch_size, seq_len, hidden_dim]
+        encoded_condition = self.layer_norm2(encoded_condition + fused_features)  # 残差连接
+
+        # 2. flow_matching 处理 - 完整迭代过程
+        current_state = encoded_condition  # [batch_size, seq_len, hidden_dim]
+        # 我还是需要预测的向量来计算 L_fm 对吧，呜呜呜
+        predicted_vector_field = self.flow_matchine(current_state)
+
+
+        start_step = int(timesteps[0].item() * self.num_timesteps)  # 起始步数
+        dt = 1.0 / self.num_timesteps
+
+        for i in range(start_step, self.num_timesteps):
+            t = 1.0 - i * dt  # 从1到0
+            
+            # 预测速度场
+            vector_field = self.flow_matchine(current_state)
+            current_state = current_state - vector_field * dt
+        
+        # 生成 encoded_action_head 也就是动作编码的估计值
+        encoded_action_head = current_state
+
+
+        # 解码为动作
+        predicted_action_from_encoded_action_head = self.action_decoder(encoded_action_head)
+
+        # 3. action_VAE 处理
+        encoded_action = self.action_encoder(ground_truth_trajectory)
+        true_vector_field = encoded_action - current_state
+
+        predicted_action_from_encoded_action = self.action_decoder(encoded_action)
+
+        
+        return  predicted_vector_field, \
+                true_vector_field, \
+                encoded_action_head, \
+                encoded_action, \
+                predicted_action_from_encoded_action, \
+                predicted_action_from_encoded_action_head
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
