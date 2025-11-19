@@ -130,6 +130,7 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
         for batch in train_pbar:
             # 获取数据
             trajectories = batch['trajectory'].to(device)  # [batch_size, seq_len, 3]
+
             conditions = batch['condition'].to(device)     # [batch_size, condition_dim]
             
             batch_size = trajectories.shape[0]
@@ -140,7 +141,7 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
             
             # 梯度置零
             optimizer.zero_grad()
-            
+            # print('准备前向推理')
             # 模型前向推理
             predicted_vector_field, \
             true_vector_field, \
@@ -148,7 +149,8 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
             encoded_action, \
             predicted_action_from_encoded_action, \
             predicted_action_from_encoded_action_head = model(conditions, t, trajectories)  
-
+            # print('完成前向推理')
+            # print('准备计算损失')
             # 计算损失
             lambda_fm = 0.33
             lambda_fld = 0.33
@@ -160,10 +162,11 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
             loss_ae = torch.nn.functional.mse_loss(trajectories, predicted_action_from_encoded_action)
 
             loss = lambda_fm * loss_fm + lambda_fld * loss_fld + lambda_ae * loss_ae
-
+            # print('完成损失计算')
+            # print('准备反向传播')
             # 反向传播
             loss.backward()
-            
+            # print('完成反向传播')
             # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
@@ -182,7 +185,7 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
                 'fld_loss': f'{loss_fld.item():.4f}', 
                 'ae_loss': f'{loss_ae.item():.4f}'
             })
-        
+                        
         # 计算平均损失
         avg_train_loss = epoch_loss / len(train_loader)
         avg_fm_loss = epoch_fm_loss / len(train_loader)
@@ -243,7 +246,7 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
         scheduler.step()
         
         # 定期保存checkpoint
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 20 == 0:
             save_checkpoint({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -254,10 +257,10 @@ def train_VITA_Large_VAE(model, train_loader, val_loader=None, epochs=100, lr=1e
                 'best_val_loss': best_val_loss,
             }, save_dir, filename=f'checkpoint_epoch_{epoch+1}.pth')
         
-        # 每10个epoch保存一次loss曲线
-        if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
-            plot_loss_curves(train_losses, train_fm_losses, train_fld_losses, train_ae_losses, 
-                           val_losses, learning_rates, save_dir, epoch + 1)
+        # # 每10个epoch保存一次loss曲线
+        # if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
+        #     plot_loss_curves(train_losses, train_fm_losses, train_fld_losses, train_ae_losses, 
+        #                    val_losses, learning_rates, save_dir, epoch + 1)
     
     # 训练结束后保存最终的checkpoint和loss曲线
     save_checkpoint({

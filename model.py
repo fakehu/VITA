@@ -272,14 +272,14 @@ class VITA_Large_VAE(nn.Module):
 
         # condtion编码器
         self.condition_encoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim*2),
+            nn.Linear(self.condition_dim, hidden_dim*2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim*2, hidden_dim),
         )
 
-        #flow_matchine
-        self.flow_matchine = nn.Sequential(
+        #flow_matching
+        self.flow_matching = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim*2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -323,13 +323,16 @@ class VITA_Large_VAE(nn.Module):
             torch.nn.init.constant_(module.bias, 0)
             torch.nn.init.constant_(module.weight, 1.0)
 
-    def forward(self, condition, timesteps, ground_truth_trajectory):
+    def forward(self, condition, timesteps, ground_truth_trajectory, inference_mode=False):
         """
         condition: [batch_size, condition_dim]
         timesteps: [batch_size] - 在flow matching中是时间t ∈ [0,1]
         """
-        batch_size, seq_len, _ = ground_truth_trajectory.shape
-        
+        if inference_mode:
+            seq_len = 32
+        else:
+            batch_size, seq_len, _ = ground_truth_trajectory.shape
+
         # 1.condition处理
         # # 1.1 编码轨迹
         # traj_embed = self.trajectory_encoder(noisy_trajectory)  # [batch_size, seq_len, hidden_dim]
@@ -355,21 +358,42 @@ class VITA_Large_VAE(nn.Module):
         encoded_condition = self.layer_norm2(encoded_condition + fused_features)  # 残差连接
 
         # 2. flow_matching 处理 - 完整迭代过程
-        current_state = encoded_condition  # [batch_size, seq_len, hidden_dim]
+        current_state = encoded_condition.clone() # [batch_size, seq_len, hidden_dim]
         # 我还是需要预测的向量来计算 L_fm 对吧，呜呜呜
-        predicted_vector_field = self.flow_matchine(current_state)
+        predicted_vector_field = self.flow_matching(current_state)
 
-
-        start_step = int(timesteps[0].item() * self.num_timesteps)  # 起始步数
+        # 为每个样本计算需要迭代的步数
+        start_steps = (timesteps * self.num_timesteps).long()  # [batch_size]
         dt = 1.0 / self.num_timesteps
 
-        for i in range(start_step, self.num_timesteps):
-            t = 1.0 - i * dt  # 从1到0
+        # 创建迭代掩码
+        max_steps = start_steps.max()
+        steps_range = torch.arange(max_steps, device=condition.device)  # [max_steps]
+
+        # 为每个样本创建步数掩码 [batch_size, max_steps]
+        step_mask = steps_range.unsqueeze(0) >= start_steps.unsqueeze(1)  # [batch_size, max_steps]
+
+
+        # 批量处理所有迭代步
+        for step_idx in range(max_steps):
+            # 获取需要当前步的样本掩码
+            current_mask = step_mask[:, step_idx]  # [batch_size]
             
-            # 预测速度场
-            vector_field = self.flow_matchine(current_state)
-            current_state = current_state - vector_field * dt
+            if current_mask.any():
+                t = 1.0 - step_idx * dt
+                
+                # 预测速度场
+                vector_field = self.flow_matching(current_state)
+                
+                # 只更新需要当前步的样本
+                update_mask = current_mask.unsqueeze(-1).unsqueeze(-1)  # [batch_size, 1, 1]
+                current_state = torch.where(update_mask, 
+                                        current_state - vector_field * dt,
+                                        current_state)
         
+
+
+
         # 生成 encoded_action_head 也就是动作编码的估计值
         encoded_action_head = current_state
 
@@ -378,11 +402,14 @@ class VITA_Large_VAE(nn.Module):
         predicted_action_from_encoded_action_head = self.action_decoder(encoded_action_head)
 
         # 3. action_VAE 处理
-        encoded_action = self.action_encoder(ground_truth_trajectory)
-        true_vector_field = encoded_action - current_state
-
-        predicted_action_from_encoded_action = self.action_decoder(encoded_action)
-
+        if not inference_mode:
+            encoded_action = None
+            true_vector_field = None
+            predicted_action_from_encoded_action = None
+        else:
+            encoded_action = self.action_encoder(ground_truth_trajectory)
+            true_vector_field = encoded_action - current_state
+            predicted_action_from_encoded_action = self.action_decoder(encoded_action)
         
         return  predicted_vector_field, \
                 true_vector_field, \
